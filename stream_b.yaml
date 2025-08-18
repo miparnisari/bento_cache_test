@@ -1,0 +1,35 @@
+input:
+  generate:
+    interval: 2ms
+    mapping: root = {}
+  processors:
+    - label: "get_b"
+      cache:
+        resource: file_cache
+        operator: get
+        key: cache
+    - catch:
+        - mapping: |
+            root = {}
+
+pipeline:
+  processors:
+    - label: "update_b"
+      mapping: |
+        root = if (this == null) { {} } else { this }
+        root.b = if (this.b == null) {
+          1
+        } else { 
+          this.b + 1
+        }
+    - label: "set_cache_b"
+      cache:
+        resource: file_cache
+        operator: set
+        key: cache
+        value: '${! this }'
+
+cache_resources:
+  - label: file_cache
+    file:
+      directory: ./
