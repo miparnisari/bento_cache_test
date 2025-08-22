@@ -16,58 +16,36 @@ import (
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
-func runStream(ctx context.Context, configFile, streamName string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Read YAML configuration from file
-	configYAML, err := os.ReadFile(configFile)
-	if err != nil {
-		log.Printf("Failed to read %s config file: %v", streamName, err)
-		return
-	}
-
-	builder := service.NewStreamBuilder()
-
-	// Parse the configuration
-	err = builder.SetYAML(string(configYAML))
-	if err != nil {
-		log.Printf("Failed to create %s: %v", streamName, err)
-		return
-	}
-
-	stream, err := builder.Build()
-	if err != nil {
-		log.Printf("Failed to create %s: %v", streamName, err)
-		return
-	}
-
-	log.Printf("Starting %s...", streamName)
-
-	// Run the stream
-	if err := stream.Run(ctx); err != nil {
-		log.Printf("%s finished with error: %v", streamName, err)
-	} else {
-		log.Printf("%s finished cleanly", streamName)
-	}
+func produceee(ctx context.Context, producer service.MessageHandlerFunc) {
+	producer(ctx, service.NewMessage([]byte("Hello from stream A!")))
+	producer(ctx, service.NewMessage([]byte("Another hello from stream A!")))
 }
 
-func monitorCache(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if data, err := os.ReadFile("cache"); err == nil {
-				fmt.Printf("=== Cache content at %s ===\n", time.Now().Format("15:04:05"))
-				fmt.Printf("%s\n\n", string(data))
-			} else {
-				fmt.Println("Cache file not yet created...")
-			}
-		}
+func createStreamB(ctx context.Context, streamName string) (*service.StreamBuilder, service.MessageHandlerFunc, error) {
+	streamBBuilder := service.NewStreamBuilder()
+	producerFunc, err := streamBBuilder.AddProducerFunc()
+	if err != nil {
+		log.Printf("Failed to add producer function to %s: %v", streamName, err)
+		return nil, nil, err
 	}
+	err = streamBBuilder.AddProcessorYAML(`
+mapping: |
+  root = content().string().uppercase()
+`)
+	if err != nil {
+		log.Printf("Failed to add procesor to %s: %v", streamName, err)
+		return nil, nil, err
+	}
+	streamBBuilder.AddConsumerFunc(func(ctx context.Context, message *service.Message) error {
+		bytes, err := message.AsBytes()
+		if err != nil {
+			return err
+		}
+		fmt.Println("consuming message", string(bytes))
+		return nil
+	})
+
+	return streamBBuilder, producerFunc, nil
 }
 
 func main() {
@@ -88,13 +66,51 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Start monitoring cache in a separate goroutine
-	go monitorCache(ctx)
+	streamBBuilder, streamBproducer, err := createStreamB(ctx, "streamB")
+	if err != nil {
+		log.Fatalf("Failed to build streamB: %v", err)
+	}
 
-	// Start both streams
-	wg.Add(2)
-	go runStream(ctx, "stream_a.yaml", "Stream A", &wg)
-	go runStream(ctx, "stream_b.yaml", "Stream B", &wg)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		interval, err := time.ParseDuration("1s")
+		if err != nil {
+			return
+		}
+		for {
+			fmt.Println("building stream")
+			stream, err := streamBBuilder.Build()
+			if err != nil {
+				log.Printf("Failed to build: %v", err)
+				return
+			}
+			streamDone := make(chan error, 1)
+			go func() {
+				streamDone <- stream.Run(ctx)
+			}()
+
+			select {
+			case <-ctx.Done():
+				<-streamDone
+				fmt.Println("streamB context done, exiting")
+				return
+			case <-time.After(interval):
+				fmt.Println("stopping streamB gracefully...")
+				err := stream.Stop(ctx)
+				if err != nil {
+					fmt.Println("failed to stop streamB gracefully:", err)
+					return
+				}
+				// ... and run again
+			}
+		}
+	}()
+
+	log.Println("Producing messages to stream B...")
+
+	time.Sleep(3 * time.Second)
+	produceee(ctx, streamBproducer)
 
 	// Wait for interrupt signal
 	<-sigChan
