@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"sync"
@@ -16,9 +17,27 @@ import (
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
-func produceee(ctx context.Context, producer service.MessageHandlerFunc) {
-	producer(ctx, service.NewMessage([]byte("Hello from stream A!")))
-	producer(ctx, service.NewMessage([]byte("Another hello from stream A!")))
+var trafficLightIDs = []string{"one", "two"}
+
+func produceSomeEvents(producer service.MessageHandlerFunc) {
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		// producing blocks until the message can be accepted, so do it in a goroutine
+		go func() {
+			defer wg.Done()
+			tid := trafficLightIDs[rand.Int64N(int64(len(trafficLightIDs)))]
+			msg := fmt.Sprintf("{ \"traffic_light\": \"%s\",  \"created_at\": \"%s\", \"passengers\": %d}", tid, time.Now().Format(time.RFC3339), rand.Int64N(10))
+			fmt.Println("sending message", msg)
+			err := producer(context.Background(), service.NewMessage([]byte(msg)))
+			if err != nil {
+				log.Printf("Failed to produce message to stream B: %v", err)
+				return
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func createStreamB(ctx context.Context, streamName string) (*service.StreamBuilder, service.MessageHandlerFunc, error) {
@@ -28,22 +47,51 @@ func createStreamB(ctx context.Context, streamName string) (*service.StreamBuild
 		log.Printf("Failed to add producer function to %s: %v", streamName, err)
 		return nil, nil, err
 	}
-	err = streamBBuilder.AddProcessorYAML(`
-mapping: |
-  root = content().string().uppercase()
+	err = streamBBuilder.SetBufferYAML(`
+system_window:
+  timestamp_mapping: root = this.created_at
+  size: 10s
 `)
 	if err != nil {
-		log.Printf("Failed to add procesor to %s: %v", streamName, err)
+		log.Printf("Failed to set buffer for %s: %v", streamName, err)
 		return nil, nil, err
 	}
-	streamBBuilder.AddConsumerFunc(func(ctx context.Context, message *service.Message) error {
+	err = streamBBuilder.AddProcessorYAML(`
+  # Group messages of the window into batches of common traffic light IDs
+  group_by_value:
+    value: '${! json("traffic_light") }'`)
+	if err != nil {
+		log.Printf("Failed to add processor 1 to %s: %v", streamName, err)
+		return nil, nil, err
+	}
+	err = streamBBuilder.AddProcessorYAML(`
+  # Reduce each batch to a single message by deleting indexes > 0, and
+  # aggregate the car and passenger counts.
+mapping: |
+    root = if batch_index() == 0 {
+      {
+        "traffic_light": this.traffic_light,
+        "created_at": metadata("window_end_timestamp"),
+        "passengers": json("passengers").from_all().sum(),
+      }
+    } else { deleted() }
+`)
+	if err != nil {
+		log.Printf("Failed to add procesor 2 to %s: %v", streamName, err)
+		return nil, nil, err
+	}
+	err = streamBBuilder.AddConsumerFunc(func(ctx context.Context, message *service.Message) error {
 		bytes, err := message.AsBytes()
 		if err != nil {
 			return err
 		}
-		fmt.Println("consuming message", string(bytes))
+		fmt.Println("-> consuming message", string(bytes))
 		return nil
 	})
+	if err != nil {
+		log.Printf("Failed to add consumer function to %s: %v", streamName, err)
+		return nil, nil, err
+	}
 
 	return streamBBuilder, producerFunc, nil
 }
@@ -58,7 +106,6 @@ func main() {
 
 	// Create context that can be cancelled
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
@@ -68,53 +115,37 @@ func main() {
 
 	streamBBuilder, streamBproducer, err := createStreamB(ctx, "streamB")
 	if err != nil {
+		log.Fatalf("Failed to create streamB: %v", err)
+	}
+
+	streamB, err := streamBBuilder.Build()
+	if err != nil {
 		log.Fatalf("Failed to build streamB: %v", err)
 	}
 
+	// receiver of messages
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		interval, err := time.ParseDuration("1s")
+		err := streamB.Run(ctx)
 		if err != nil {
-			return
+			log.Printf("error running: %v", err)
 		}
-		for {
-			fmt.Println("building stream")
-			stream, err := streamBBuilder.Build()
-			if err != nil {
-				log.Printf("Failed to build: %v", err)
-				return
-			}
-			streamDone := make(chan error, 1)
-			go func() {
-				streamDone <- stream.Run(ctx)
-			}()
-
-			select {
-			case <-ctx.Done():
-				<-streamDone
-				fmt.Println("streamB context done, exiting")
-				return
-			case <-time.After(interval):
-				fmt.Println("stopping streamB gracefully...")
-				err := stream.Stop(ctx)
-				if err != nil {
-					fmt.Println("failed to stop streamB gracefully:", err)
-					return
-				}
-				// ... and run again
-			}
-		}
+		streamB.Stop(context.Background())
 	}()
 
-	log.Println("Producing messages to stream B...")
-
-	time.Sleep(3 * time.Second)
-	produceee(ctx, streamBproducer)
-
-	// Wait for interrupt signal
-	<-sigChan
-	fmt.Println("\nReceived interrupt signal, stopping streams...")
+	// sender of messages
+Loop:
+	for {
+		select {
+		case <-sigChan:
+			fmt.Println("\nReceived interrupt signal, stopping streams...")
+			break Loop
+		case <-time.After(1 * time.Second):
+			produceSomeEvents(streamBproducer)
+			goto Loop
+		}
+	}
 
 	// Cancel context to stop all operations
 	cancel()
