@@ -27,7 +27,7 @@ func produceSomeEvents(producer service.MessageHandlerFunc) {
 		go func() {
 			defer wg.Done()
 			tid := trafficLightIDs[rand.Int64N(int64(len(trafficLightIDs)))]
-			msg := fmt.Sprintf("{ \"traffic_light\": \"%s\",  \"created_at\": \"%s\", \"passengers\": %d}", tid, time.Now().Format(time.RFC3339), rand.Int64N(10))
+			msg := fmt.Sprintf("{ \"traffic_light\": \"%s\",  \"created_at\": \"%s\", \"passengers\": %d}", tid, time.Now().Add(-24*time.Hour).Format(time.RFC3339), rand.Int64N(10))
 			fmt.Println("sending message", msg)
 			err := producer(context.Background(), service.NewMessage([]byte(msg)))
 			if err != nil {
