@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -20,33 +19,67 @@ import (
 
 var trafficLightIDs = []string{"one", "two"}
 
-//go:embed bento.yaml
-var pipeline string
-
 func produceSomeEvents(producer service.MessageHandlerFunc) {
-	tid := trafficLightIDs[rand.Int64N(int64(len(trafficLightIDs)))]
-	msg := fmt.Sprintf("{ \"traffic_light\": \"%s\",  \"created_at\": \"%s\", \"passengers\": %d}", tid, time.Now().Format(time.RFC3339), rand.Int64N(10))
-	fmt.Println("sending message", msg)
-	err := producer(context.Background(), service.NewMessage([]byte(msg)))
-	if err != nil {
-		log.Printf("Failed to produce message to stream B: %v", err)
-		return
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		// producing blocks until the message can be accepted, so do it in a goroutine
+		go func() {
+			defer wg.Done()
+			tid := trafficLightIDs[rand.Int64N(int64(len(trafficLightIDs)))]
+			msg := fmt.Sprintf("{ \"traffic_light\": \"%s\",  \"created_at\": \"%s\", \"passengers\": %d}", tid, time.Now().Format(time.RFC3339), rand.Int64N(10))
+			fmt.Println("sending message", msg)
+			err := producer(context.Background(), service.NewMessage([]byte(msg)))
+			if err != nil {
+				log.Printf("Failed to produce message to stream B: %v", err)
+				return
+			}
+		}()
 	}
+
+	wg.Wait()
 }
 
 func createStreamB(ctx context.Context, streamName string) (*service.StreamBuilder, service.MessageHandlerFunc, error) {
 	streamBBuilder := service.NewStreamBuilder()
-	err := streamBBuilder.SetYAML(pipeline)
-	if err != nil {
-		log.Printf("Failed to set pipeline %s: %v", streamName, err)
-		return nil, nil, err
-	}
 	producerFunc, err := streamBBuilder.AddProducerFunc()
 	if err != nil {
 		log.Printf("Failed to add producer function to %s: %v", streamName, err)
 		return nil, nil, err
 	}
-
+	err = streamBBuilder.SetBufferYAML(`
+system_window:
+  timestamp_mapping: root = this.created_at
+  size: 10s
+`)
+	if err != nil {
+		log.Printf("Failed to set buffer for %s: %v", streamName, err)
+		return nil, nil, err
+	}
+	err = streamBBuilder.AddProcessorYAML(`
+  # Group messages of the window into batches of common traffic light IDs
+  group_by_value:
+    value: '${! json("traffic_light") }'`)
+	if err != nil {
+		log.Printf("Failed to add processor 1 to %s: %v", streamName, err)
+		return nil, nil, err
+	}
+	err = streamBBuilder.AddProcessorYAML(`
+  # Reduce each batch to a single message by deleting indexes > 0, and
+  # aggregate the car and passenger counts.
+mapping: |
+    root = if batch_index() == 0 {
+      {
+        "traffic_light": this.traffic_light,
+        "created_at": metadata("window_end_timestamp"),
+        "passengers": json("passengers").from_all().sum(),
+      }
+    } else { deleted() }
+`)
+	if err != nil {
+		log.Printf("Failed to add procesor 2 to %s: %v", streamName, err)
+		return nil, nil, err
+	}
 	err = streamBBuilder.AddConsumerFunc(func(ctx context.Context, message *service.Message) error {
 		bytes, err := message.AsBytes()
 		if err != nil {
